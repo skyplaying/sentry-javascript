@@ -1,11 +1,6 @@
-import {
-  getCurrentHub,
-  initAndBind,
-  Integrations as CoreIntegrations,
-  ReportDialogOptions,
-  SDK_VERSION,
-} from '@sentry/core';
+import { getCurrentHub, initAndBind, Integrations as CoreIntegrations, SDK_VERSION } from '@sentry/core';
 import { addInstrumentationHandler, getGlobalObject, logger, SyncPromise } from '@sentry/utils';
+import { ReportDialogOptions } from '@sentry/transport-base';
 
 import { BrowserOptions } from './backend';
 import { BrowserClient } from './client';
