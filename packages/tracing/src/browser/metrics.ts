@@ -1,16 +1,16 @@
 /* eslint-disable max-lines */
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { Measurements, SpanContext } from '@sentry/types';
-import { browserPerformanceTimeOrigin, getGlobalObject, htmlTreeAsString, logger } from '@sentry/utils';
+import { browserPerformanceTimeOrigin, getGlobalObject, htmlTreeAsString, isNodeEnv, logger } from '@sentry/utils';
 
 import { Span } from '../span';
 import { Transaction } from '../transaction';
 import { msToSec } from '../utils';
-import { getCLS } from './web-vitals/getCLS';
+import { getCLS, LayoutShift } from './web-vitals/getCLS';
 import { getFID } from './web-vitals/getFID';
 import { getLCP, LargestContentfulPaint } from './web-vitals/getLCP';
-import { getTTFB } from './web-vitals/getTTFB';
-import { getFirstHidden } from './web-vitals/lib/getFirstHidden';
+import { getUpdatedCLS } from './web-vitals/getUpdatedCLS';
+import { getVisibilityWatcher } from './web-vitals/lib/getVisibilityWatcher';
 import { NavigatorDeviceMemory, NavigatorNetworkInformation } from './web-vitals/types';
 
 const global = getGlobalObject<Window>();
@@ -21,9 +21,11 @@ export class MetricsInstrumentation {
 
   private _performanceCursor: number = 0;
   private _lcpEntry: LargestContentfulPaint | undefined;
+  private _clsEntry: LayoutShift | undefined;
+  private _updatedClsEntry: LayoutShift | undefined;
 
   public constructor() {
-    if (global && global.performance) {
+    if (!isNodeEnv() && global?.performance) {
       if (global.performance.mark) {
         global.performance.mark('sentry-tracing-init');
       }
@@ -31,7 +33,6 @@ export class MetricsInstrumentation {
       this._trackCLS();
       this._trackLCP();
       this._trackFID();
-      this._trackTTFB();
     }
   }
 
@@ -47,14 +48,14 @@ export class MetricsInstrumentation {
     const timeOrigin = msToSec(browserPerformanceTimeOrigin);
     let entryScriptSrc: string | undefined;
 
-    if (global.document) {
+    if (global.document && global.document.scripts) {
       // eslint-disable-next-line @typescript-eslint/prefer-for-of
-      for (let i = 0; i < document.scripts.length; i++) {
+      for (let i = 0; i < global.document.scripts.length; i++) {
         // We go through all scripts on the page and look for 'data-entry'
         // We remember the name and measure the time between this script finished loading and
         // our mark 'sentry-tracing-init'
-        if (document.scripts[i].dataset.entry === 'true') {
-          entryScriptSrc = document.scripts[i].src;
+        if (global.document.scripts[i].dataset.entry === 'true') {
+          entryScriptSrc = global.document.scripts[i].src;
           break;
         }
       }
@@ -62,6 +63,8 @@ export class MetricsInstrumentation {
 
     let entryScriptStartTimestamp: number | undefined;
     let tracingInitMarkStartTime: number | undefined;
+    let responseStartTimestamp: number | undefined;
+    let requestStartTimestamp: number | undefined;
 
     global.performance
       .getEntries()
@@ -75,9 +78,12 @@ export class MetricsInstrumentation {
         }
 
         switch (entry.entryType) {
-          case 'navigation':
+          case 'navigation': {
             addNavigationSpans(transaction, entry, timeOrigin);
+            responseStartTimestamp = timeOrigin + msToSec(entry.responseStart as number);
+            requestStartTimestamp = timeOrigin + msToSec(entry.requestStart as number);
             break;
+          }
           case 'mark':
           case 'paint':
           case 'measure': {
@@ -88,9 +94,9 @@ export class MetricsInstrumentation {
 
             // capture web vitals
 
-            const firstHidden = getFirstHidden();
+            const firstHidden = getVisibilityWatcher();
             // Only report if the page wasn't hidden prior to the web vital.
-            const shouldRecord = entry.startTime < firstHidden.timeStamp;
+            const shouldRecord = entry.startTime < firstHidden.firstHiddenTime;
 
             if (entry.name === 'first-paint' && shouldRecord) {
               logger.log('[Measurements] Adding FP');
@@ -139,7 +145,20 @@ export class MetricsInstrumentation {
 
       const timeOrigin = msToSec(browserPerformanceTimeOrigin);
 
-      ['fcp', 'fp', 'lcp', 'ttfb'].forEach(name => {
+      // Generate TTFB (Time to First Byte), which measured as the time between the beginning of the transaction and the
+      // start of the response in milliseconds
+      if (typeof responseStartTimestamp === 'number') {
+        logger.log('[Measurements] Adding TTFB');
+        this._measurements['ttfb'] = { value: (responseStartTimestamp - transaction.startTimestamp) * 1000 };
+
+        if (typeof requestStartTimestamp === 'number' && requestStartTimestamp <= responseStartTimestamp) {
+          // Capture the time spent making the request and receiving the first byte of the response.
+          // This is the time between the start of the request and the start of the response in milliseconds.
+          this._measurements['ttfb.requestTime'] = { value: (responseStartTimestamp - requestStartTimestamp) * 1000 };
+        }
+      }
+
+      ['fcp', 'fp', 'lcp'].forEach(name => {
         if (!this._measurements[name] || timeOrigin >= transaction.startTimestamp) {
           return;
         }
@@ -170,27 +189,52 @@ export class MetricsInstrumentation {
         });
       }
 
-      transaction.setMeasurements(this._measurements);
-
-      if (this._lcpEntry) {
-        logger.log('[Measurements] Adding LCP Data');
-        // Capture Properties of the LCP element that contributes to the LCP.
-
-        if (this._lcpEntry.element) {
-          transaction.setTag('lcp.element', htmlTreeAsString(this._lcpEntry.element));
-        }
-
-        if (this._lcpEntry.id) {
-          transaction.setTag('lcp.id', this._lcpEntry.id);
-        }
-
-        if (this._lcpEntry.url) {
-          // Trim URL to the first 200 characters.
-          transaction.setTag('lcp.url', this._lcpEntry.url.trim().slice(0, 200));
-        }
-
-        transaction.setTag('lcp.size', this._lcpEntry.size);
+      // If FCP is not recorded we should not record the updated cls value
+      // according to the new definition of CLS.
+      if (!('fcp' in this._measurements)) {
+        delete this._measurements['updated-cls'];
       }
+
+      transaction.setMeasurements(this._measurements);
+      this._tagMetricInfo(transaction);
+    }
+  }
+
+  /** Add LCP / CLS data to transaction to allow debugging */
+  private _tagMetricInfo(transaction: Transaction): void {
+    if (this._lcpEntry) {
+      logger.log('[Measurements] Adding LCP Data');
+      // Capture Properties of the LCP element that contributes to the LCP.
+
+      if (this._lcpEntry.element) {
+        transaction.setTag('lcp.element', htmlTreeAsString(this._lcpEntry.element));
+      }
+
+      if (this._lcpEntry.id) {
+        transaction.setTag('lcp.id', this._lcpEntry.id);
+      }
+
+      if (this._lcpEntry.url) {
+        // Trim URL to the first 200 characters.
+        transaction.setTag('lcp.url', this._lcpEntry.url.trim().slice(0, 200));
+      }
+
+      transaction.setTag('lcp.size', this._lcpEntry.size);
+    }
+
+    // See: https://developer.mozilla.org/en-US/docs/Web/API/LayoutShift
+    if (this._clsEntry && this._clsEntry.sources) {
+      logger.log('[Measurements] Adding CLS Data');
+      this._clsEntry.sources.forEach((source, index) =>
+        transaction.setTag(`cls.source.${index + 1}`, htmlTreeAsString(source.node)),
+      );
+    }
+
+    if (this._updatedClsEntry && this._updatedClsEntry.sources) {
+      logger.log('[Measurements] Adding Updated CLS Data');
+      this._updatedClsEntry.sources.forEach((source, index) =>
+        transaction.setTag(`updated-cls.source.${index + 1}`, htmlTreeAsString(source.node)),
+      );
     }
   }
 
@@ -198,13 +242,27 @@ export class MetricsInstrumentation {
   private _trackCLS(): void {
     getCLS(metric => {
       const entry = metric.entries.pop();
-
       if (!entry) {
         return;
       }
 
       logger.log('[Measurements] Adding CLS');
       this._measurements['cls'] = { value: metric.value };
+      this._clsEntry = entry as LayoutShift;
+    });
+
+    // See:
+    // https://web.dev/evolving-cls/
+    // https://web.dev/cls-web-tooling/
+    getUpdatedCLS(metric => {
+      const entry = metric.entries.pop();
+      if (!entry) {
+        return;
+      }
+
+      logger.log('[Measurements] Adding Updated CLS');
+      this._measurements['updated-cls'] = { value: metric.value };
+      this._updatedClsEntry = entry as LayoutShift;
     });
   }
 
@@ -213,13 +271,11 @@ export class MetricsInstrumentation {
    */
   private _trackNavigator(transaction: Transaction): void {
     const navigator = global.navigator as null | (Navigator & NavigatorNetworkInformation & NavigatorDeviceMemory);
-
     if (!navigator) {
       return;
     }
 
     // track network connectivity
-
     const connection = navigator.connection;
     if (connection) {
       if (connection.effectiveType) {
@@ -280,24 +336,6 @@ export class MetricsInstrumentation {
       logger.log('[Measurements] Adding FID');
       this._measurements['fid'] = { value: metric.value };
       this._measurements['mark.fid'] = { value: timeOrigin + startTime };
-    });
-  }
-
-  /** Starts tracking the Time to First Byte on the current page. */
-  private _trackTTFB(): void {
-    getTTFB(metric => {
-      const entry = metric.entries.pop();
-
-      if (!entry) {
-        return;
-      }
-
-      logger.log('[Measurements] Adding TTFB');
-      this._measurements['ttfb'] = { value: metric.value };
-
-      // Capture the time spent making the request and receiving the first byte of the response
-      const requestTime = metric.value - ((metric.entries[0] ?? entry) as PerformanceNavigationTiming).requestStart;
-      this._measurements['ttfb.requestTime'] = { value: requestTime };
     });
   }
 }
